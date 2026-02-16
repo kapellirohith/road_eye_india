@@ -1,0 +1,388 @@
+import os
+import time
+import json
+import csv
+import datetime
+import threading
+from collections import deque
+from picamera2 import Picamera2
+
+import cv2
+import numpy as np
+
+try:
+    from picamera2 import Picamera2
+    HAVE_PICAM = True
+except Exception:
+    Picamera2 = None
+    HAVE_PICAM = False
+
+from libcamera_stream import LibcameraStream
+
+try:
+    from tflite_runtime.interpreter import Interpreter
+except Exception:
+    from tensorflow.lite import Interpreter
+
+
+class TFLiteDetector:
+    def __init__(self, model_path, labels_path, input_size, score_thresh, nms_thresh, max_det):
+        self.labels = self._load_labels(labels_path)
+        self.score_thresh = score_thresh
+        self.nms_thresh = nms_thresh
+        self.max_det = max_det
+        self.input_size = input_size
+
+        self.interpreter = Interpreter(model_path=model_path, num_threads=2)
+        self.interpreter.allocate_tensors()
+        self.input_details = self.interpreter.get_input_details()[0]
+        self.output_details = self.interpreter.get_output_details()
+
+        self.input_dtype = self.input_details["dtype"]
+        self.input_scale, self.input_zero = self.input_details.get("quantization", (0.0, 0))
+
+    def _load_labels(self, path):
+        with open(path, "r") as f:
+            return [line.strip() for line in f if line.strip()]
+
+    def _quantize(self, img):
+        if self.input_dtype == np.float32:
+            return img.astype(np.float32) / 255.0
+        if self.input_dtype == np.uint8:
+            return img.astype(np.uint8)
+        if self.input_dtype == np.int8:
+            img = img.astype(np.float32) / 255.0
+            if self.input_scale > 0:
+                img = img / self.input_scale + self.input_zero
+            return np.clip(np.round(img), -128, 127).astype(np.int8)
+        return img
+
+    def infer(self, frame_bgr, score_thresh_override=None):
+        h, w = frame_bgr.shape[:2]
+        thresh = self.score_thresh if score_thresh_override is None else score_thresh_override
+
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        resized = cv2.resize(rgb, (self.input_size, self.input_size))
+        input_data = np.expand_dims(resized, axis=0)
+        input_data = self._quantize(input_data)
+
+        self.interpreter.set_tensor(self.input_details["index"], input_data)
+        self.interpreter.invoke()
+
+        outputs = [self.interpreter.get_tensor(o["index"]) for o in self.output_details]
+        if len(outputs) < 3:
+            return []
+
+        boxes = outputs[0]
+        classes = outputs[1]
+        scores = outputs[2]
+        count = outputs[3] if len(outputs) > 3 else None
+
+        num = int(count[0]) if count is not None else boxes.shape[1]
+
+        boxes_list, scores_list, class_list = [], [], []
+        for i in range(num):
+            score = float(scores[0][i])
+            if score < thresh:
+                continue
+            class_id = int(classes[0][i])
+            if class_id < 0 or class_id >= len(self.labels):
+                continue
+
+            ymin, xmin, ymax, xmax = boxes[0][i]
+            x1 = int(max(0, xmin * w))
+            y1 = int(max(0, ymin * h))
+            x2 = int(min(w - 1, xmax * w))
+            y2 = int(min(h - 1, ymax * h))
+
+            bw = max(1, x2 - x1)
+            bh = max(1, y2 - y1)
+
+            boxes_list.append([x1, y1, bw, bh])
+            scores_list.append(score)
+            class_list.append(class_id)
+
+        keep = cv2.dnn.NMSBoxes(boxes_list, scores_list, thresh, self.nms_thresh)
+        detections = []
+        if len(keep) > 0:
+            for k in keep.flatten():
+                x, y, bw, bh = boxes_list[k]
+                detections.append({
+                    "label": self.labels[class_list[k]],
+                    "score": scores_list[k],
+                    "bbox": (x, y, x + bw, y + bh)
+                })
+                if len(detections) >= self.max_det:
+                    break
+
+        return detections
+
+
+class FrameRing:
+    def __init__(self, maxlen):
+        self.frames = deque(maxlen=maxlen)
+
+    def push(self, frame):
+        self.frames.append(frame.copy())
+
+    def get(self):
+        return list(self.frames)
+
+
+class ClipWriter:
+    def __init__(self, fps, frame_size):
+        self.fps = fps
+        self.frame_size = frame_size
+        self.queue = deque(maxlen=2)
+        self.lock = threading.Lock()
+        self.worker = threading.Thread(target=self._run, daemon=True)
+        self.worker.start()
+
+    def submit(self, frames, path):
+        if not frames:
+            return
+        with self.lock:
+            if len(self.queue) >= 2:
+                return
+            self.queue.append((frames, path))
+
+    def _run(self):
+        while True:
+            job = None
+            with self.lock:
+                if self.queue:
+                    job = self.queue.popleft()
+            if job is None:
+                time.sleep(0.05)
+                continue
+            frames, path = job
+            fourcc = cv2.VideoWriter_fourcc(*"XVID")
+            out = cv2.VideoWriter(path, fourcc, self.fps, self.frame_size)
+            if out.isOpened():
+                for f in frames:
+                    out.write(f)
+                out.release()
+
+
+def ensure_dirs(*paths):
+    for p in paths:
+        os.makedirs(p, exist_ok=True)
+
+
+def ensure_log(path):
+    if not os.path.exists(path):
+        with open(path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["timestamp", "label", "score", "distance_m", "bbox", "brightness"])
+
+
+def main():
+    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    with open(os.path.join(base_dir, "config.json"), "r") as f:
+        cfg = json.load(f)
+
+    cam_cfg = cfg["camera"]
+    det_cfg = cfg["detector"]
+    evt_cfg = cfg["events"]
+    rec_cfg = cfg["recording"]
+    path_cfg = cfg["paths"]
+    disp_cfg = cfg["display"]
+    tune_cfg = cfg["tuning"]
+    roi_cfg = cfg["roi"]
+
+    ensure_dirs(
+        os.path.join(base_dir, path_cfg["logs_dir"]),
+        os.path.join(base_dir, path_cfg["snapshots_dir"]),
+        os.path.join(base_dir, path_cfg["clips_dir"]),
+        os.path.join(base_dir, path_cfg["full_dir"])
+    )
+    log_path = os.path.join(base_dir, path_cfg["log_csv"])
+    ensure_log(log_path)
+
+    detector = TFLiteDetector(
+        model_path=os.path.join(base_dir, det_cfg["model_path"]),
+        labels_path=os.path.join(base_dir, det_cfg["labels_path"]),
+        input_size=det_cfg["input_size"],
+        score_thresh=det_cfg["score_thresh"],
+        nms_thresh=det_cfg["nms_thresh"],
+        max_det=det_cfg["max_detections"]
+    )
+
+    frame_size = (cam_cfg["width"], cam_cfg["height"])
+    record_fps = rec_cfg["record_fps"] or cam_cfg["fps"]
+
+use_picam = cam_cfg.get("use_picamera2", False) and HAVE_PICAM
+use_libcam = cam_cfg.get("use_libcamera", False)
+cap = None
+picam2 = None
+libcam = None
+
+if use_picam:
+    ...
+elif use_libcam:
+    libcam = LibcameraStream(cam_cfg["width"], cam_cfg["height"], cam_cfg["fps"])
+else:
+    cap = cv2.VideoCapture(cam_cfg["usb_index"])
+    ...
+    if use_picam:
+        picam2 = Picamera2()
+        config = picam2.create_preview_configuration(
+            main={"format": cam_cfg["format"], "size": frame_size},
+            controls={"FrameRate": cam_cfg["fps"]}
+        )
+        picam2.configure(config)
+        picam2.start()
+        time.sleep(0.2)
+    else:
+        cap = cv2.VideoCapture(cam_cfg["usb_index"])
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, cam_cfg["width"])
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cam_cfg["height"])
+        cap.set(cv2.CAP_PROP_FPS, cam_cfg["fps"])
+
+    ring = FrameRing(maxlen=int(rec_cfg["clip_pre_s"] * cam_cfg["fps"]))
+    clip_writer = ClipWriter(record_fps, frame_size)
+
+    full_out = None
+    if rec_cfg["record_full"]:
+        ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        full_path = os.path.join(base_dir, path_cfg["full_dir"], f"full_{ts}.avi")
+        fourcc = cv2.VideoWriter_fourcc(*"XVID")
+        full_out = cv2.VideoWriter(full_path, fourcc, record_fps, frame_size)
+
+    infer_every = max(1, det_cfg["infer_every"])    last_dets = []
+    frame_idx = 0
+    fps = 0.0
+    last_event_time = 0.0
+    event_streak = 0
+    collecting_post = 0
+    clip_frames = []
+    clip_path = ""
+
+    while True:
+        t0 = time.perf_counter()
+
+        if use_picam:
+            rgb = picam2.capture_array()
+            if rgb is None:
+                continue
+            frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        else:
+            ok, frame = cap.read()
+            if not ok:
+                continue
+
+        h, w = frame.shape[:2]
+        brightness = int(frame.mean())
+        score_boost = tune_cfg["night_score_boost"] if brightness < tune_cfg["night_brightness"] else 0.0
+        score_thresh = det_cfg["score_thresh"] + score_boost
+
+        if frame_idx % infer_every == 0:
+            dets = detector.infer(frame, score_thresh_override=score_thresh)
+            last_dets = dets
+        else:
+            dets = last_dets
+
+        warning = False
+        event_candidates = []
+
+        for d in dets:
+            label = d["label"]
+            score = d["score"]
+            x1, y1, x2, y2 = d["bbox"]
+            bw = max(1, x2 - x1)
+            bh = max(1, y2 - y1)
+            cy = y1 + bh // 2
+
+            in_road = cy >= int(roi_cfg["road_y_start"] * h)
+
+            if label in evt_cfg["road_only_classes"] and not in_road:
+                continue
+
+            dist = None
+            if label in evt_cfg["distance_classes"]:
+                dist = round(evt_cfg["distance_factor"] / max(1, bh), 1)
+
+            close = dist is not None and dist < evt_cfg["warn_distance_m"]
+            color = (0, 0, 255) if close else (0, 255, 0)
+
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            text = f"{label} {score:.2f}"
+            if dist is not None:
+                text += f" {dist}m"
+            cv2.putText(frame, text, (x1, max(15, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+            if close:
+                warning = True
+
+            if label in evt_cfg["event_classes"] and score >= evt_cfg["event_score_thresh"]:
+                if label in evt_cfg["road_only_classes"]:
+                    event_candidates.append(d)
+                elif close or in_road:
+                    event_candidates.append(d)
+
+        if warning:
+            cv2.putText(frame, "WARNING: CLOSE", (w // 2 - 110, 40),
+                        cv2.FONT_HERSHEY_DUPLEX, 1.0, (0, 0, 255), 3)
+
+        ring.push(frame)
+
+        now = time.time()
+        if event_candidates:
+            event_streak += 1
+        else:
+            event_streak = 0
+
+        if event_streak >= evt_cfg["confirm_frames"] and (now - last_event_time) > evt_cfg["cooldown_s"]:
+            event = max(event_candidates, key=lambda x: x["score"])
+            ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            label = event["label"]
+
+            snap_path = os.path.join(base_dir, path_cfg["snapshots_dir"], f"{ts}_{label}.jpg")
+            cv2.imwrite(snap_path, frame)
+
+            with open(log_path, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([ts, label, f"{event['score']:.3f}", "", event["bbox"], brightness])
+
+            if rec_cfg["save_clips"]:
+                clip_frames = ring.get() + [frame.copy()]
+                collecting_post = int(rec_cfg["clip_post_s"] * cam_cfg["fps"])
+                clip_path = os.path.join(base_dir, path_cfg["clips_dir"], f"{ts}_{label}.avi")
+
+            last_event_time = now
+            event_streak = 0
+
+        if collecting_post > 0:
+            clip_frames.append(frame.copy())
+            collecting_post -= 1
+            if collecting_post == 0:
+                clip_writer.submit(clip_frames, clip_path)
+
+        dt = time.perf_counter() - t0
+        inst_fps = 1.0 / dt if dt > 0 else 0.0
+        fps = inst_fps if fps == 0 else (fps * 0.9 + inst_fps * 0.1)
+        cv2.putText(frame, f"FPS {fps:.1f} | B {brightness}", (10, 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        if full_out:
+            full_out.write(frame)
+
+        if disp_cfg["enabled"] and os.environ.get("DISPLAY"):
+            dw, dh = disp_cfg["size"]
+            cv2.imshow("ROAD_EYE INDIA", cv2.resize(frame, (dw, dh)))
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+
+        frame_idx += 1
+
+    if full_out:
+        full_out.release()
+    if picam2:
+        picam2.stop()
+    if cap:
+        cap.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()

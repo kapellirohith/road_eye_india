@@ -1,0 +1,9 @@
+pothole
+auto-rickshaw
+animal
+person
+bicycle
+motorbike
+car
+bus
+truck

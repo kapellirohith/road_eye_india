@@ -1,0 +1,89 @@
+{
+  "camera": {
+    "use_picamera2": false,
+    "usb_index": 0,
+    "width": 320,
+    "height": 240,
+    "fps": 30,
+    "format": "RGB888",
+    "use_libcamera": true
+  },
+  "detector": {
+    "model_path": "models/road_vision_int8.tflite",
+    "labels_path": "labels.txt",
+    "input_size": 320,
+    "score_thresh": 0.5,
+    "nms_thresh": 0.45,
+    "max_detections": 50,
+    "infer_every": 2,
+    "threads": 4
+  },
+  "roi": {
+    "road_y_start": 0.55
+  },
+  "events": {
+    "cooldown_s": 2.0,
+    "event_score_thresh": 0.45,
+    "warn_distance_m": 2.5,
+    "distance_factor": 2000.0,
+    "confirm_frames": 2,
+    "event_classes": [
+      "pothole",
+      "speed_bump",
+      "debris",
+      "auto-rickshaw",
+      "person",
+      "bicycle",
+      "motorbike",
+      "car",
+      "bus",
+      "truck",
+      "cow",
+      "dog",
+      "goat"
+    ],
+    "distance_classes": [
+      "person",
+      "bicycle",
+      "motorbike",
+      "car",
+      "bus",
+      "truck",
+      "auto-rickshaw",
+      "cow",
+      "dog",
+      "goat"
+    ],
+    "road_only_classes": [
+      "pothole",
+      "speed_bump",
+      "debris"
+    ]
+  },
+  "recording": {
+    "save_clips": true,
+    "clip_pre_s": 2.0,
+    "clip_post_s": 3.0,
+    "record_full": true,
+    "record_fps": 15,
+    "record_audio": true
+  },
+  "tuning": {
+    "night_brightness": 60,
+    "night_score_boost": 0.05
+  },
+  "paths": {
+    "logs_dir": "data/logs",
+    "snapshots_dir": "data/snapshots",
+    "clips_dir": "data/clips",
+    "full_dir": "data/full",
+    "log_csv": "data/logs/events.csv"
+  },
+  "display": {
+    "enabled": true,
+    "size": [
+      480,
+      270
+    ]
+  }
+}

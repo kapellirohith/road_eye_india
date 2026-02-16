@@ -1,0 +1,13 @@
+.env
+.venv
+*.pyc
+__pycache__/
+*.log
+data/full/
+data/clips/
+data/snapshots/
+data/logs/
+*.avi
+*.wav
+*.mp4
+*.jpg
